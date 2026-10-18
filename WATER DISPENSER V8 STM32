@@ -1,0 +1,445 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdbool.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+typedef enum { IDLE, RINSING, CHANGE, DISPENSING, PAUSED, CONFIG, FAULT } state_t;
+static volatile state_t state = IDLE;
+static volatile uint32_t coin_pulses, flow_pulses, hopper_pulses;
+static volatile uint32_t last_coin_ms;
+static uint16_t shift_register;
+static uint32_t last_hopper_us, state_start_ms, last_flow_ms;
+static uint32_t dispense_start_ms, pause_start_ms, pause_elapsed_ms;
+static uint8_t fault_code, pause_count;
+static int32_t balance_soles, change_due, change_sent;
+static float target_liters, dispensed_liters;
+static uint16_t pulses_per_liter = 430;
+static uint16_t price_2l = 1, price_7l = 2, price_10l = 3, price_20l = 5;
+static uint8_t dispense_mode; /* 0=SENS, 1=TIME */
+static uint32_t time_per_liter_ms = 10000, total_revenue, total_coins, save_due_ms;
+static uint16_t rinse_seconds = 5;
+static bool rinse_done;
+static uint32_t last_pause_action_ms, add_hold_ms, minus_hold_ms, add_repeat_ms, minus_repeat_ms;
+static uint8_t config_step;
+static uint32_t config_value;
+static GPIO_PinState last_ok = GPIO_PIN_RESET, last_add = GPIO_PIN_RESET, last_minus = GPIO_PIN_RESET;
+static GPIO_PinState last_pause = GPIO_PIN_RESET;
+typedef struct { uint32_t magic,seq; uint16_t p2,p7,p10,p20,pulses,rinse_s; uint8_t mode; uint8_t reserved; uint32_t time_ms,revenue,coins,check; } nv_t;
+#define NV_MAGIC 0x44575038UL
+#define NV_ADDR  0x0801FC00UL
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+/* USER CODE BEGIN PFP */
+static void outputs_off(void); static void display_init(void); static void display_show(void);
+static void shift_write(uint16_t value); static void set_shift(uint8_t bit, bool value);
+static void dispense_start(float liters); static void finish(void); static void fault(uint8_t code);
+static void config_enter(void); static void config_process(void); static void config_show(void); static void config_delta(int32_t delta);
+static void nv_load(void); static void nv_save(void);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+static void pulse(GPIO_TypeDef *port, uint16_t pin) { HAL_GPIO_WritePin(port,pin,GPIO_PIN_SET); HAL_GPIO_WritePin(port,pin,GPIO_PIN_RESET); }
+static void shift_write(uint16_t v) {
+  /* U16 recibe primero; U22 recibe el byte alto. Se envian 16 bits MSB primero. */
+  HAL_GPIO_WritePin(GPIOB,SR_LATCH_Pin,GPIO_PIN_RESET);
+  for (int i=15;i>=0;i--) { HAL_GPIO_WritePin(GPIOB,SR_DATA_Pin,(v&(1U<<i))?GPIO_PIN_SET:GPIO_PIN_RESET); pulse(GPIOB,SR_CLOCK_Pin); }
+  HAL_GPIO_WritePin(GPIOB,SR_LATCH_Pin,GPIO_PIN_SET);
+}
+static void set_shift(uint8_t bit, bool on) { if(on) shift_register|=(1U<<bit); else shift_register&=~(1U<<bit); shift_write(shift_register); }
+static void max_write(uint8_t reg,uint8_t data) { HAL_GPIO_WritePin(GPIOB,MAX_CS_Pin,GPIO_PIN_RESET); for(int i=15;i>=0;i--){ uint16_t w=((uint16_t)reg<<8)|data; HAL_GPIO_WritePin(GPIOB,MAX_DIN_Pin,(w&(1U<<i))?GPIO_PIN_SET:GPIO_PIN_RESET); pulse(GPIOB,MAX_CLK_Pin); } HAL_GPIO_WritePin(GPIOB,MAX_CS_Pin,GPIO_PIN_SET); }
+static void display_init(void) { max_write(0x0C,1); max_write(0x0F,0); max_write(0x0B,7); max_write(0x0A,8); for(uint8_t i=1;i<=8;i++)max_write(i,0); }
+static void display_show(void) {
+  static const uint8_t dig[]={0x7e,0x30,0x6d,0x79,0x33,0x5b,0x5f,0x70,0x7f,0x7b};
+  if(state==FAULT){ max_write(1,0x4f);max_write(2,0x05);max_write(3,0x05);max_write(8,dig[fault_code%10]);return; }
+  if(state==CONFIG){ config_show(); return; }
+  /* Latido visible sólo en reposo sin saldo: 700 ms visible / 200 ms apagado. */
+  if(state==IDLE && balance_soles==0 && (HAL_GetTick()%900U)>=700U){ for(uint8_t i=1;i<=8;i++)max_write(i,0); return; }
+  uint16_t money=(balance_soles>99)?99:balance_soles; uint16_t cl=(uint16_t)(dispensed_liters*100.0f);
+  max_write(1,dig[money/10]); max_write(2,dig[money%10]|0x80); max_write(3,dig[0]); max_write(4,dig[0]);
+  max_write(5,dig[(cl/1000)%10]); max_write(6,dig[(cl/100)%10]|0x80); max_write(7,dig[(cl/10)%10]); max_write(8,dig[cl%10]);
+}
+static void outputs_off(void){ HAL_GPIO_WritePin(GPIOA,VALVE_DISP_Pin|PUMP_Pin|VALVE_RINSE_Pin,GPIO_PIN_RESET); HAL_GPIO_WritePin(GPIOB,HOPPER_MOTOR_Pin|AC_AUX_Pin,GPIO_PIN_RESET); }
+static void fault(uint8_t code){ outputs_off(); fault_code=code; state=FAULT; set_shift(0,true); display_show(); }
+static void finish(void){ outputs_off(); total_revenue+=(uint32_t)balance_soles; save_due_ms=HAL_GetTick()+1000U; balance_soles=0; dispensed_liters=0; state=IDLE; pause_count=0; rinse_done=false; set_shift(0,false); display_show(); }
+static void dispense_start(float liters){
+  uint32_t now=HAL_GetTick();
+  if(HAL_GPIO_ReadPin(GPIOA,WATER_LEVEL_Pin)!=GPIO_PIN_SET){fault(1);return;}
+  target_liters=liters; flow_pulses=0; dispensed_liters=0; last_flow_ms=now;
+  dispense_start_ms=now; pause_elapsed_ms=0; last_pause_action_ms=now;
+  HAL_GPIO_WritePin(GPIOA,PUMP_Pin|VALVE_DISP_Pin,GPIO_PIN_SET); state=DISPENSING;
+}
+static uint32_t checksum(const nv_t *n){ const uint32_t *p=(const uint32_t*)n;uint32_t x=0;for(uint32_t i=0;i<(sizeof(nv_t)/4U)-1U;i++)x^=p[i];return x; }
+static void nv_load(void){
+  const nv_t *n=(const nv_t*)NV_ADDR;
+  if(n->magic==NV_MAGIC && n->check==checksum(n)){
+    price_2l=n->p2; price_7l=n->p7; price_10l=n->p10; price_20l=n->p20;
+    pulses_per_liter=(n->pulses>0U)?n->pulses:430U;
+    rinse_seconds=(n->rinse_s>=2U && n->rinse_s<=6U)?n->rinse_s:5U;
+    dispense_mode=(n->mode<=1U)?n->mode:0U;
+    time_per_liter_ms=(n->time_ms>=10U && n->time_ms<=59990U)?n->time_ms:10000U;
+    total_revenue=n->revenue; total_coins=n->coins;
+  }
+}
+static void nv_save(void){
+  nv_t n={NV_MAGIC,1,price_2l,price_7l,price_10l,price_20l,pulses_per_liter,rinse_seconds,dispense_mode,0,time_per_liter_ms,total_revenue,total_coins,0};
+  n.check=checksum(&n); HAL_FLASH_Unlock();
+  FLASH_EraseInitTypeDef e={FLASH_TYPEERASE_PAGES,NV_ADDR,1}; uint32_t err;
+  if(HAL_FLASHEx_Erase(&e,&err)==HAL_OK)
+    for(uint32_t i=0;i<sizeof(n);i+=2) HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,NV_ADDR+i,*(uint16_t*)((uint8_t*)&n+i));
+  HAL_FLASH_Lock();
+}
+static void config_show(void) {
+  static const uint8_t d[]={0x7e,0x30,0x6d,0x79,0x33,0x5b,0x5f,0x70,0x7f,0x7b};
+  /* Etiquetas: P.2L., P.7L., P.10L., P.20L., MODE, PUL.S, TIME, T.ENJ, C.REC, C.MON. */
+  uint8_t a=0x67,b=0,c=0,e=0;
+  if(config_step==0){a|=0x80;b=d[2];c=0x0e|0x80;}
+  else if(config_step==1){a|=0x80;b=d[7];c=0x0e|0x80;}
+  else if(config_step==2){a|=0x80;b=d[1];c=d[0];e=0x0e|0x80;}
+  else if(config_step==3){a|=0x80;b=d[2];c=d[0];e=0x0e|0x80;}
+  else if(config_step==4){a=0x37;b=0x1d;c=0x3d;e=0x4f;}                 /* MODE */
+  else if(config_step==5){a=0x67;b=0x3e;c=0x0e|0x80;e=0x5b;}            /* PUL.S */
+  else if(config_step==6){a=0x0f;b=0x06;c=0x37;e=0x4f;}                 /* TIME */
+  else if(config_step==7){a=0x0f;b=0x4f|0x80;c=0x15;e=0x78;}            /* T.ENJ */
+  else if(config_step==8){a=0x4e|0x80;b=0x05;c=0x4f;e=0x4e;}            /* C.REC */
+  else {a=0x4e|0x80;b=0x37;c=0x15;e=0x4e;}                              /* C.MON */
+  max_write(1,a);max_write(2,b);max_write(3,c);max_write(4,e);
+  if(config_step==4){
+    /* SENS = por sensor de flujo; TIME = por tiempo programado. */
+    if(config_value==0U){max_write(5,0x5b);max_write(6,0x4f);max_write(7,0x15);max_write(8,0x5b);}
+    else {max_write(5,0x0f);max_write(6,0x06);max_write(7,0x37);max_write(8,0x4f);}
+    return;
+  }
+  if(config_step==6){
+    /* SS.MS: centésimas (pasos de 10 ms), por ejemplo 10.25. */
+    uint32_t s=config_value/1000U,cs=(config_value%1000U)/10U;
+    max_write(5,d[(s/10)%10]); max_write(6,d[s%10]|0x80); max_write(7,d[(cs/10)%10]); max_write(8,d[cs%10]); return;
+  }
+  uint32_t div=1000U;for(uint8_t pos=5;pos<=8;pos++,div/=10U){uint8_t q=(config_value/div)%10U;max_write(pos,(config_value<div&&pos<8)?0:d[q]);}
+}
+static void config_enter(void){
+  config_step=0; config_value=price_2l; state=CONFIG;
+  /* En esta placa los dos pulsadores están cruzados respecto de la serigrafía. */
+  last_add=HAL_GPIO_ReadPin(GPIOB,BTN_OK_Pin); last_minus=HAL_GPIO_ReadPin(GPIOB,BTN_MINUS_Pin); last_ok=HAL_GPIO_ReadPin(GPIOB,BTN_ADD_Pin);
+  add_hold_ms=minus_hold_ms=add_repeat_ms=minus_repeat_ms=0;
+  display_show();
+}
+static void config_delta(int32_t delta){
+  uint32_t min=1U,max=9999U,step=1U;
+  if(config_step==4U){min=0U;max=1U;}
+  else if(config_step==5U){min=1U;max=9999U;}
+  else if(config_step==6U){min=10U;max=59990U;step=10U;}
+  else if(config_step==7U){min=2U;max=6U;}
+  else if(config_step>=8U)return;
+  uint32_t amount=(delta<0)?(uint32_t)(-delta):(uint32_t)delta;
+  amount*=step;
+  if(delta<0) config_value=(config_value>min+amount-1U)?config_value-amount:min;
+  else config_value=(config_value+amount<max)?config_value+amount:max;
+  display_show();
+}
+static void config_process(void) {
+  GPIO_PinState add=HAL_GPIO_ReadPin(GPIOB,BTN_OK_Pin), minus=HAL_GPIO_ReadPin(GPIOB,BTN_MINUS_Pin), ok=HAL_GPIO_ReadPin(GPIOB,BTN_ADD_Pin);
+  uint32_t now=HAL_GetTick();
+  if(add==GPIO_PIN_SET && last_add==GPIO_PIN_RESET){
+    if(config_step==8U){total_revenue=0;config_value=0;nv_save();} else config_delta(1);
+    add_hold_ms=add_repeat_ms=now;
+  }
+  if(minus==GPIO_PIN_SET && last_minus==GPIO_PIN_RESET){
+    if(config_step==8U){total_revenue=0;config_value=0;nv_save();} else config_delta(-1);
+    minus_hold_ms=minus_repeat_ms=now;
+  }
+  /* Repetición sostenida: inicia a 600 ms y acelera en TIME después de 2/4 s. */
+  if(add==GPIO_PIN_SET && config_step!=8U && now-add_hold_ms>=600U && now-add_repeat_ms>=120U){
+    int32_t delta=(config_step==6U && now-add_hold_ms>=4000U)?50:((config_step==6U && now-add_hold_ms>=2000U)?10:1);
+    config_delta(delta); add_repeat_ms=now;
+  }
+  if(minus==GPIO_PIN_SET && config_step!=8U && now-minus_hold_ms>=600U && now-minus_repeat_ms>=120U){
+    int32_t delta=(config_step==6U && now-minus_hold_ms>=4000U)?-50:((config_step==6U && now-minus_hold_ms>=2000U)?-10:-1);
+    config_delta(delta); minus_repeat_ms=now;
+  }
+  if(ok==GPIO_PIN_SET && last_ok==GPIO_PIN_RESET){
+    if(config_step==0)price_2l=config_value; else if(config_step==1)price_7l=config_value;
+    else if(config_step==2)price_10l=config_value; else if(config_step==3)price_20l=config_value;
+    else if(config_step==4)dispense_mode=(uint8_t)config_value; else if(config_step==5)pulses_per_liter=(uint16_t)config_value;
+    else if(config_step==6)time_per_liter_ms=config_value; else if(config_step==7)rinse_seconds=(uint16_t)config_value;
+    else if(config_step==8)total_revenue=0;
+    config_step++;
+    if(config_step>9U){nv_save();state=IDLE;display_show();}
+    else {
+      config_value=(config_step==1U)?price_7l:(config_step==2U)?price_10l:(config_step==3U)?price_20l:
+                   (config_step==4U)?dispense_mode:(config_step==5U)?pulses_per_liter:(config_step==6U)?time_per_liter_ms:
+                   (config_step==7U)?rinse_seconds:(config_step==8U)?total_revenue:total_coins;
+      display_show();
+    }
+  }
+  last_add=add;last_minus=minus;last_ok=ok;
+}
+void HAL_GPIO_EXTI_Callback(uint16_t pin){ uint32_t now=HAL_GetTick(); if(pin==COIN_Pin){coin_pulses++;last_coin_ms=now;} else if(pin==FLOW_Pin && state==DISPENSING){flow_pulses++;} else if(pin==HOPPER_SENSE_Pin && state==CHANGE){uint32_t us=HAL_GetTick()*1000U;if(us-last_hopper_us>15000U){last_hopper_us=us;hopper_pulses++;}} }
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  /* USER CODE BEGIN 2 */
+  outputs_off();
+  shift_write(0);                 /* monedas liberadas, LEDs apagados al inicio */
+  display_init();
+  nv_load();
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+  display_show();
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    uint32_t now=HAL_GetTick();
+    if(state==IDLE && coin_pulses && now-last_coin_ms>30U){
+      uint32_t p=coin_pulses; coin_pulses=0;
+      if(balance_soles==0)rinse_done=false;
+      balance_soles+=p; total_coins+=p; save_due_ms=now+10000U;
+      if(balance_soles>20)balance_soles=20; display_show();
+    }
+    if(state==CONFIG){ config_process(); continue; }
+    GPIO_PinState ok_now=HAL_GPIO_ReadPin(GPIOB,BTN_ADD_Pin);
+    if(state==IDLE && balance_soles==0 && ok_now==GPIO_PIN_SET && last_ok==GPIO_PIN_RESET){ config_enter(); last_ok=ok_now; HAL_Delay(220); continue; }
+    last_ok=ok_now;
+    if((state==RINSING || state==DISPENSING) && HAL_GPIO_ReadPin(GPIOA,WATER_LEVEL_Pin)!=GPIO_PIN_SET) fault(1);
+    if(state==RINSING && now-state_start_ms>=((uint32_t)rinse_seconds*1000U)){
+      outputs_off(); rinse_done=true; state=IDLE; display_show();
+    }
+    if(state==CHANGE){ uint32_t p=hopper_pulses; hopper_pulses=0; if(p){change_sent+=p;state_start_ms=now;if(change_sent>=change_due){HAL_GPIO_WritePin(GPIOB,HOPPER_MOTOR_Pin,GPIO_PIN_RESET);balance_soles-=change_due;dispense_start(target_liters);}} else if(now-state_start_ms>2000U)fault(2); }
+    if(state==DISPENSING){
+      uint32_t active_ms=now-dispense_start_ms-pause_elapsed_ms;
+      dispensed_liters=dispense_mode?((float)active_ms/(float)time_per_liter_ms):((float)flow_pulses/pulses_per_liter);
+      if(flow_pulses)last_flow_ms=now;
+      if(!dispense_mode&&now-last_flow_ms>30000U)fault(3);
+      if(dispensed_liters>=target_liters)finish();
+    }
+    if(state==PAUSED && now-pause_start_ms>30000U)finish();
+    if(state==IDLE && balance_soles>0){ float l=0;uint16_t price=0; if(HAL_GPIO_ReadPin(GPIOA,SEL_2L_Pin)) {l=2;price=price_2l;} else if(HAL_GPIO_ReadPin(GPIOA,SEL_7L_Pin)){l=7;price=price_7l;} else if(HAL_GPIO_ReadPin(GPIOA,SEL_10L_Pin)){l=10;price=price_10l;} else if(HAL_GPIO_ReadPin(GPIOA,SEL_20L_Pin)){l=20;price=price_20l;} if(price && balance_soles>=price){change_due=balance_soles-price;target_liters=l;if(change_due){change_sent=0;hopper_pulses=0;state=CHANGE;state_start_ms=now;HAL_GPIO_WritePin(GPIOB,HOPPER_MOTOR_Pin,GPIO_PIN_SET);}else dispense_start(l);HAL_Delay(300);} }
+    GPIO_PinState pause_now=HAL_GPIO_ReadPin(GPIOB,PAUSE_Pin);
+    if(pause_now==GPIO_PIN_SET && last_pause==GPIO_PIN_RESET){
+      if(state==IDLE && balance_soles>0 && !rinse_done){
+        HAL_GPIO_WritePin(GPIOA,PUMP_Pin|VALVE_RINSE_Pin,GPIO_PIN_SET);
+        state=RINSING; state_start_ms=now;
+      } else if(state==DISPENSING && pause_count<3U && now-last_pause_action_ms>=3000U){
+        HAL_GPIO_WritePin(GPIOA,PUMP_Pin|VALVE_DISP_Pin,GPIO_PIN_RESET);
+        state=PAUSED; pause_start_ms=now; pause_count++; last_pause_action_ms=now;
+      } else if(state==PAUSED && now-last_pause_action_ms>=3000U){
+        pause_elapsed_ms+=now-pause_start_ms;
+        HAL_GPIO_WritePin(GPIOA,PUMP_Pin|VALVE_DISP_Pin,GPIO_PIN_SET);
+        state=DISPENSING; last_flow_ms=now; last_pause_action_ms=now;
+      }
+    }
+    last_pause=pause_now;
+    if(state==FAULT && HAL_GPIO_ReadPin(GPIOB,BTN_OK_Pin)==GPIO_PIN_SET){finish();HAL_Delay(300);}
+    set_shift(0,state!=IDLE); set_shift(1,HAL_GPIO_ReadPin(GPIOA,WATER_LEVEL_Pin)!=GPIO_PIN_SET); set_shift(3,HAL_GPIO_ReadPin(GPIOA,WATER_LEVEL_Pin)==GPIO_PIN_SET); set_shift(4,state==DISPENSING);
+    if((now%100U)<5U)display_show();
+    if(save_due_ms && now>=save_due_ms){nv_save();save_due_ms=0;}
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, HOPPER_MOTOR_Pin|AC_AUX_Pin|MAX_CLK_Pin|MAX_CS_Pin|MAX_DIN_Pin|SR_DATA_Pin|SR_LATCH_Pin|SR_CLOCK_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PA0 PA1 PA2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* Entradas con polarización externa de la placa. */
+  GPIO_InitStruct.Pin = WATER_LEVEL_Pin|SEL_20L_Pin|SEL_10L_Pin|SEL_7L_Pin|SEL_2L_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT; GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = PAUSE_Pin|BTN_MINUS_Pin|BTN_ADD_Pin|BTN_OK_Pin;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA8 PA9 PA10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = HOPPER_MOTOR_Pin|AC_AUX_Pin|MAX_CLK_Pin|MAX_CS_Pin|MAX_DIN_Pin|SR_DATA_Pin|SR_LATCH_Pin|SR_CLOCK_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP; GPIO_InitStruct.Pull = GPIO_NOPULL; GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
